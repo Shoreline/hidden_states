@@ -1,4 +1,5 @@
 torch>=2.0
+torchvision
 transformers>=4.37.0
 accelerate
 numpy
