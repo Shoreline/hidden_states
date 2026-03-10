@@ -22,7 +22,7 @@ from typing import Optional, Union
 
 from src.model_loader import load_model
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
 
 # --- Global state ---
@@ -147,6 +147,7 @@ def parse_openai_messages(messages: list[ChatMessage]):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     """OpenAI-compatible chat completions with hidden state extraction."""
+    t0 = time.time()
     if request.stream:
         raise HTTPException(status_code=400, detail="Streaming not supported")
 
@@ -212,11 +213,20 @@ async def chat_completions(request: ChatCompletionRequest):
         last_token_hs = last_layer_hs[:, -1, :]    # (batch, hidden_dim)
         hidden_dim = last_token_hs.shape[-1]
 
+        # Convert to CPU list BEFORE freeing GPU memory
+        hs_list = last_token_hs[0].float().cpu().tolist()
+
         completion_tokens = generated_ids.shape[1]
 
+        # Free GPU memory: hidden_states from all generation steps are huge (~1.5GB+)
+        del outputs, last_step_hs, last_layer_hs, last_token_hs
+        del inputs, generated_ids
+        torch.cuda.empty_cache()
+
+        elapsed = time.time() - t0
         logger.info(
-            f"Generated {completion_tokens} tokens, hidden_dim={hidden_dim}, "
-            f"response_preview={response_text[:80]!r}"
+            f"[{elapsed:.1f}s] prompt={input_len} tokens, generated={completion_tokens} tokens, "
+            f"hidden_dim={hidden_dim}, preview={response_text[:80]!r}"
         )
 
         return ChatCompletionResponse(
@@ -233,7 +243,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 total_tokens=input_len + completion_tokens,
             ),
             hidden_state=HiddenStateInfo(
-                last_token=last_token_hs[0].float().cpu().tolist(),
+                last_token=hs_list,
                 layer=-1,
                 hidden_dim=hidden_dim,
                 model=app_state["model_name"],

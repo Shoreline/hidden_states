@@ -8,3 +8,5 @@ jupyter
 fastapi
 uvicorn
 pillow
+torchvision
+qwen-vl-utils
