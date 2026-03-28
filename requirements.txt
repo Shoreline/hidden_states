@@ -10,3 +10,4 @@ uvicorn
 pillow
 torchvision
 qwen-vl-utils
+python-multipart
