@@ -10,6 +10,7 @@ import argparse
 import base64
 import io
 import logging
+import threading
 import time
 import uuid
 
@@ -33,6 +34,9 @@ app_state = {
 }
 
 app = FastAPI(title="Hidden States VL Server")
+
+# GPU 推理锁：单卡只能串行推理，用锁保护避免多线程同时 generate 导致 OOM
+_inference_lock = threading.Lock()
 
 
 # --- Request/Response models ---
@@ -88,7 +92,12 @@ class ChatCompletionResponse(BaseModel):
 # --- Helpers ---
 
 def decode_base64_image(data_url: str) -> Image.Image:
-    """Decode a base64 data URL or raw base64 string to PIL Image."""
+    """Decode a base64 data URL, raw base64 string, or HTTP URL to PIL Image."""
+    if data_url.startswith("http://") or data_url.startswith("https://"):
+        import urllib.request
+        with urllib.request.urlopen(data_url) as resp:
+            image_bytes = resp.read()
+        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
     if data_url.startswith("data:"):
         # data:image/jpeg;base64,/9j/4AAQ...
         _, b64_data = data_url.split(",", 1)
@@ -145,8 +154,13 @@ def parse_openai_messages(messages: list[ChatMessage]):
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
-    """OpenAI-compatible chat completions with hidden state extraction."""
+def chat_completions(request: ChatCompletionRequest):
+    """OpenAI-compatible chat completions with hidden state extraction.
+
+    使用同步 def（非 async def），FastAPI 自动在线程池中执行，
+    不阻塞 event loop，健康检查和连接管理保持响应。
+    _inference_lock 保证单卡 GPU 推理串行，避免 OOM。
+    """
     t0 = time.time()
     if request.stream:
         raise HTTPException(status_code=400, detail="Streaming not supported")
@@ -155,7 +169,7 @@ async def chat_completions(request: ChatCompletionRequest):
     processor = app_state["processor"]
 
     try:
-        # Parse messages
+        # Parse messages（含 urllib 图片下载，可并行于其他请求的 GPU 推理）
         qwen_messages, images = parse_openai_messages(request.messages)
 
         # Apply chat template
@@ -182,46 +196,48 @@ async def chat_completions(request: ChatCompletionRequest):
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
         input_len = inputs["input_ids"].shape[1]
 
-        # Generate with hidden states
-        with torch.no_grad():
-            gen_kwargs = dict(
-                max_new_tokens=request.max_tokens,
-                top_p=request.top_p,
-                output_hidden_states=True,
-                return_dict_in_generate=True,
-            )
-            if request.temperature > 0:
-                gen_kwargs["temperature"] = request.temperature
-                gen_kwargs["do_sample"] = True
-            else:
-                gen_kwargs["do_sample"] = False
+        # GPU 推理串行：用锁保护，避免多线程同时 generate
+        with _inference_lock:
+            # Generate with hidden states
+            with torch.no_grad():
+                gen_kwargs = dict(
+                    max_new_tokens=request.max_tokens,
+                    top_p=request.top_p,
+                    output_hidden_states=True,
+                    return_dict_in_generate=True,
+                )
+                if request.temperature > 0:
+                    gen_kwargs["temperature"] = request.temperature
+                    gen_kwargs["do_sample"] = True
+                else:
+                    gen_kwargs["do_sample"] = False
 
-            outputs = model.generate(**inputs, **gen_kwargs)
+                outputs = model.generate(**inputs, **gen_kwargs)
 
-        # Decode response text
-        generated_ids = outputs.sequences[:, input_len:]
-        response_text = processor.batch_decode(
-            generated_ids, skip_special_tokens=True
-        )[0]
+            # Decode response text
+            generated_ids = outputs.sequences[:, input_len:]
+            response_text = processor.batch_decode(
+                generated_ids, skip_special_tokens=True
+            )[0]
 
-        # Extract last-token hidden state from last layer.
-        # outputs.hidden_states is a tuple of (num_generated_tokens) elements.
-        # Each element is a tuple of (num_layers+1) tensors.
-        # For each generation step after the first, tensor shape is (batch, 1, hidden_dim).
-        last_step_hs = outputs.hidden_states[-1]  # last generation step
-        last_layer_hs = last_step_hs[-1]           # last layer
-        last_token_hs = last_layer_hs[:, -1, :]    # (batch, hidden_dim)
-        hidden_dim = last_token_hs.shape[-1]
+            # Extract last-token hidden state from last layer.
+            # outputs.hidden_states is a tuple of (num_generated_tokens) elements.
+            # Each element is a tuple of (num_layers+1) tensors.
+            # For each generation step after the first, tensor shape is (batch, 1, hidden_dim).
+            last_step_hs = outputs.hidden_states[-1]  # last generation step
+            last_layer_hs = last_step_hs[-1]           # last layer
+            last_token_hs = last_layer_hs[:, -1, :]    # (batch, hidden_dim)
+            hidden_dim = last_token_hs.shape[-1]
 
-        # Convert to CPU list BEFORE freeing GPU memory
-        hs_list = last_token_hs[0].float().cpu().tolist()
+            # Convert to CPU list BEFORE freeing GPU memory
+            hs_list = last_token_hs[0].float().cpu().tolist()
 
-        completion_tokens = generated_ids.shape[1]
+            completion_tokens = generated_ids.shape[1]
 
-        # Free GPU memory: hidden_states from all generation steps are huge (~1.5GB+)
-        del outputs, last_step_hs, last_layer_hs, last_token_hs
-        del inputs, generated_ids
-        torch.cuda.empty_cache()
+            # Free GPU memory: hidden_states from all generation steps are huge (~1.5GB+)
+            del outputs, last_step_hs, last_layer_hs, last_token_hs
+            del inputs, generated_ids
+            torch.cuda.empty_cache()
 
         elapsed = time.time() - t0
         logger.info(
