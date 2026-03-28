@@ -293,7 +293,10 @@ def chat_completions(request: ChatCompletionRequest):
             if v_hat is None:
                 raise HTTPException(status_code=400,
                                     detail=f"Unknown injection_id: {request.injection_id}")
-            target_layer = model.model.layers[request.injection_layer]
+            decoder_layers = app_state.get("decoder_layers")
+            if decoder_layers is None:
+                raise HTTPException(status_code=500, detail="Decoder layers not found — injection unavailable")
+            target_layer = decoder_layers[request.injection_layer]
             hook_fn = make_injection_hook(v_hat, request.injection_alpha, request.injection_mode)
             hook_handle = target_layer.register_forward_hook(hook_fn)
             injection_active = True
@@ -420,6 +423,26 @@ def main():
     app_state["model"] = model
     app_state["processor"] = processor
     app_state["model_name"] = args.model_path.rstrip("/").split("/")[-1]
+
+    # 探测 decoder layers 路径（不同 VL 模型结构不同）
+    # Qwen3-VL: model.model.language_model.layers
+    # Qwen2.5-VL: model.model.layers
+    decoder_layers = None
+    for path in ("model.language_model.layers", "model.layers"):
+        obj = model
+        try:
+            for attr in path.split("."):
+                obj = getattr(obj, attr)
+            decoder_layers = obj
+            app_state["decoder_layers_path"] = path
+            break
+        except AttributeError:
+            continue
+    if decoder_layers is None:
+        logger.warning("Could not find decoder layers — injection will not work")
+    else:
+        logger.info(f"Decoder layers: model.{path} ({len(decoder_layers)} layers)")
+    app_state["decoder_layers"] = decoder_layers
 
     hidden_dim = getattr(model.config, "hidden_size", None)
     logger.info(f"Model: {app_state['model_name']}, hidden_dim={hidden_dim}")
