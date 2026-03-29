@@ -65,6 +65,7 @@ class ChatCompletionRequest(BaseModel):
     injection_alpha: float = 0.0
     injection_mode: str = "all"       # "all" or "prefill_only"
     injection_layer: int = -1         # target layer index
+    injection_relative: bool = True   # True: alpha 相对于 ||h||; False: 绝对值
 
 
 class ChoiceMessage(BaseModel):
@@ -103,40 +104,72 @@ class ChatCompletionResponse(BaseModel):
 
 # --- Injection hook ---
 
-def make_injection_hook(v_hat_tensor: torch.Tensor, alpha: float, mode: str = "all"):
-    """创建 forward hook，在指定层的输出上注入 alpha * v_hat。
+def make_injection_hook(v_hat_tensor: torch.Tensor, alpha: float, mode: str = "all",
+                        relative: bool = True):
+    """创建 forward hook，在指定层的输出上注入方向向量。
 
     Args:
         v_hat_tensor: 归一化方向向量 (hidden_dim,)，已在 GPU 上
         alpha: 注入强度
         mode: "all" = 每个 generation step 都注入；
               "prefill_only" = 仅在 prefill 阶段（seq_len > 1）注入
+        relative: True = alpha 相对于 ||h||（如 0.05 = 5% of hidden state norm）；
+                  False = alpha 为绝对值
 
     注意：不同模型的 decoder layer forward 返回格式不同：
     - 有些返回 tuple: (hidden_states, ...)，hidden_states 为 3D (batch, seq, dim)
-    - Qwen3-VL 直接返回 tensor: hidden_states 为 2D (seq, dim)
-    Hook 需要兼容两种情况。
+    - Qwen3-VL 直接返回 tensor: hidden_states 为 2D (seq, dim) 或 3D
+    Hook 需要兼容各种情况。
     """
+    _call_count = [0]
+
+    def _get_last_token(hidden_states):
+        """获取 last token 的 hidden state 引用（支持 2D 和 3D）。"""
+        if hidden_states.ndim == 3:
+            return hidden_states[:, -1, :]  # (batch, dim)
+        else:
+            return hidden_states[-1:, :]    # (1, dim)
+
+    def _should_skip(hidden_states):
+        """prefill_only 模式：autoregressive step 时跳过。"""
+        if mode != "prefill_only":
+            return False
+        seq_dim = 1 if hidden_states.ndim == 3 else 0
+        return hidden_states.shape[seq_dim] == 1
+
+    def _inject(hidden_states):
+        """执行注入并记录诊断。"""
+        _call_count[0] += 1
+        last_h = _get_last_token(hidden_states)
+        h_norm = last_h.norm().item()
+
+        if relative:
+            delta = (alpha * h_norm) * v_hat_tensor
+        else:
+            delta = alpha * v_hat_tensor
+
+        last_h += delta
+
+        if _call_count[0] <= 3:
+            delta_norm = delta.norm().item()
+            ratio = delta_norm / h_norm * 100 if h_norm > 0 else 0
+            logger.info(f"[injection #{_call_count[0]}] shape={tuple(hidden_states.shape)}, "
+                        f"||h||={h_norm:.1f}, ||delta||={delta_norm:.1f} ({ratio:.1f}%), "
+                        f"relative={relative}")
+
     def hook(module, input, output):
         if isinstance(output, torch.Tensor):
-            # 直接返回 tensor 的模型（如 Qwen3-VL）: (seq_len, hidden_dim)
-            hidden_states = output
-            if mode == "prefill_only" and hidden_states.shape[0] == 1:
+            if _should_skip(output):
                 return output
-            hidden_states[-1, :] += alpha * v_hat_tensor
-            return hidden_states
+            _inject(output)
+            return output
         else:
-            # 返回 tuple 的模型: (hidden_states, ...)
             hidden_states = output[0]
-            if hidden_states.ndim == 3:
-                if mode == "prefill_only" and hidden_states.shape[1] == 1:
-                    return output
-                hidden_states[:, -1, :] += alpha * v_hat_tensor
-            else:
-                if mode == "prefill_only" and hidden_states.shape[0] == 1:
-                    return output
-                hidden_states[-1, :] += alpha * v_hat_tensor
+            if _should_skip(hidden_states):
+                return output
+            _inject(hidden_states)
             return (hidden_states,) + output[1:]
+
     return hook
 
 
@@ -315,7 +348,8 @@ def chat_completions(request: ChatCompletionRequest):
             if decoder_layers is None:
                 raise HTTPException(status_code=500, detail="Decoder layers not found — injection unavailable")
             target_layer = decoder_layers[request.injection_layer]
-            hook_fn = make_injection_hook(v_hat, request.injection_alpha, request.injection_mode)
+            hook_fn = make_injection_hook(v_hat, request.injection_alpha, request.injection_mode,
+                                           relative=request.injection_relative)
             hook_handle = target_layer.register_forward_hook(hook_fn)
             injection_active = True
 
@@ -372,7 +406,8 @@ def chat_completions(request: ChatCompletionRequest):
         if injection_active:
             injection_info = (f", injection=[id={request.injection_id}, "
                               f"alpha={request.injection_alpha}, mode={request.injection_mode}, "
-                              f"layer={request.injection_layer}]")
+                              f"layer={request.injection_layer}, "
+                              f"relative={request.injection_relative}]")
         logger.info(
             f"[{elapsed:.1f}s] prompt={input_len} tokens, generated={completion_tokens} tokens, "
             f"hidden_dim={hidden_dim}{injection_info}, preview={response_text[:80]!r}"
