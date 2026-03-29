@@ -111,14 +111,32 @@ def make_injection_hook(v_hat_tensor: torch.Tensor, alpha: float, mode: str = "a
         alpha: 注入强度
         mode: "all" = 每个 generation step 都注入；
               "prefill_only" = 仅在 prefill 阶段（seq_len > 1）注入
+
+    注意：不同模型的 decoder layer forward 返回格式不同：
+    - 有些返回 tuple: (hidden_states, ...)，hidden_states 为 3D (batch, seq, dim)
+    - Qwen3-VL 直接返回 tensor: hidden_states 为 2D (seq, dim)
+    Hook 需要兼容两种情况。
     """
     def hook(module, input, output):
-        hidden_states = output[0]  # (batch, seq_len, hidden_dim)
-        if mode == "prefill_only" and hidden_states.shape[1] == 1:
-            return output  # autoregressive step, skip
-        # 修改 last token position 的 hidden state
-        hidden_states[:, -1, :] += alpha * v_hat_tensor
-        return (hidden_states,) + output[1:]
+        if isinstance(output, torch.Tensor):
+            # 直接返回 tensor 的模型（如 Qwen3-VL）: (seq_len, hidden_dim)
+            hidden_states = output
+            if mode == "prefill_only" and hidden_states.shape[0] == 1:
+                return output
+            hidden_states[-1, :] += alpha * v_hat_tensor
+            return hidden_states
+        else:
+            # 返回 tuple 的模型: (hidden_states, ...)
+            hidden_states = output[0]
+            if hidden_states.ndim == 3:
+                if mode == "prefill_only" and hidden_states.shape[1] == 1:
+                    return output
+                hidden_states[:, -1, :] += alpha * v_hat_tensor
+            else:
+                if mode == "prefill_only" and hidden_states.shape[0] == 1:
+                    return output
+                hidden_states[-1, :] += alpha * v_hat_tensor
+            return (hidden_states,) + output[1:]
     return hook
 
 
