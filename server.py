@@ -11,6 +11,7 @@ import argparse
 import base64
 import io
 import logging
+import os
 import threading
 import time
 import uuid
@@ -40,6 +41,9 @@ app = FastAPI(title="Hidden States VL Server")
 
 # GPU 推理锁：单卡只能串行推理，用锁保护避免多线程同时 generate 导致 OOM
 _inference_lock = threading.Lock()
+
+# 全局开关：强制所有请求返回全层 hidden states（通过 --output_all_layers 或 env 控制）
+_force_all_layers = False
 
 # 注入向量存储：{injection_id: torch.Tensor on GPU}
 _injection_vectors: dict[str, torch.Tensor] = {}
@@ -284,6 +288,26 @@ async def list_injection_vectors():
     return {"vectors": vectors}
 
 
+@app.post("/admin/set_output_all_layers")
+async def set_output_all_layers(enabled: bool = True):
+    """动态开启/关闭全层 hidden states 输出。"""
+    global _force_all_layers
+    _force_all_layers = enabled
+    logger.info(f"output_all_layers set to {enabled}")
+    return {"output_all_layers": enabled}
+
+
+@app.get("/admin/config")
+async def get_admin_config():
+    """查看当前服务端配置。"""
+    return {
+        "output_all_layers": _force_all_layers,
+        "injection_vectors": list(_injection_vectors.keys()),
+        "model": app_state.get("model_name"),
+        "decoder_layers_path": app_state.get("decoder_layers_path"),
+    }
+
+
 @app.delete("/admin/injection_vectors/{injection_id}")
 async def delete_injection_vector(injection_id: str):
     """删除已加载的注入向量。"""
@@ -400,7 +424,7 @@ def chat_completions(request: ChatCompletionRequest):
             # 所有层 hidden states（可选）
             all_layers_b64 = None
             num_layers = len(last_step_hs) - 1  # 不含 embedding 层
-            if request.output_all_layers:
+            if request.output_all_layers or _force_all_layers:
                 # 提取每层 last token: (num_layers, hidden_dim)，跳过 layer 0 (embedding)
                 all_layers = torch.stack(
                     [last_step_hs[l][:, -1, :].squeeze(0) for l in range(1, len(last_step_hs))]
@@ -485,7 +509,13 @@ def main():
     parser.add_argument("--load_in_4bit", action="store_true", help="Load model in 4-bit quantization (saves ~75%% VRAM)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--output_all_layers", action="store_true",
+                       help="强制所有请求返回全层 hidden states（也可通过 env OUTPUT_ALL_LAYERS=1 设置）")
     args = parser.parse_args()
+
+    # 全局开关
+    global _force_all_layers
+    _force_all_layers = args.output_all_layers or os.environ.get("OUTPUT_ALL_LAYERS") == "1"
 
     # Load model
     model, processor = load_model(args.model_path, device_map=args.device_map, load_in_4bit=args.load_in_4bit)
@@ -516,6 +546,8 @@ def main():
 
     hidden_dim = getattr(model.config, "hidden_size", None)
     logger.info(f"Model: {app_state['model_name']}, hidden_dim={hidden_dim}")
+    if _force_all_layers:
+        logger.info("output_all_layers: ENABLED (all requests return full-layer hidden states)")
     logger.info(f"Starting server on {args.host}:{args.port}")
 
     uvicorn.run(app, host=args.host, port=args.port)
