@@ -66,6 +66,7 @@ class ChatCompletionRequest(BaseModel):
     injection_mode: str = "all"       # "all" or "prefill_only"
     injection_layer: int = -1         # target layer index
     injection_relative: bool = True   # True: alpha 相对于 ||h||; False: 绝对值
+    output_all_layers: bool = False   # True: 返回所有层 hidden states（base64 numpy）
 
 
 class ChoiceMessage(BaseModel):
@@ -86,10 +87,12 @@ class Usage(BaseModel):
 
 
 class HiddenStateInfo(BaseModel):
-    last_token: list[float]
-    layer: int
+    last_token: list[float]              # 单层 hidden state（向后兼容）
+    layer: int                           # 来源层（-1 = 最后一层）
     hidden_dim: int
     model: str
+    all_layers_b64: Optional[str] = None # 所有层 hidden states，base64 编码的 float32 numpy (num_layers, hidden_dim)
+    num_layers: Optional[int] = None     # decoder layer 数量（不含 embedding）
 
 
 class ChatCompletionResponse(BaseModel):
@@ -382,21 +385,33 @@ def chat_completions(request: ChatCompletionRequest):
                 generated_ids, skip_special_tokens=True
             )[0]
 
-            # Extract last-token hidden state from last layer.
+            # Extract hidden states.
             # outputs.hidden_states is a tuple of (num_generated_tokens) elements.
             # Each element is a tuple of (num_layers+1) tensors.
-            # For each generation step after the first, tensor shape is (batch, 1, hidden_dim).
+            # Layer 0 = embedding, layers 1..L = decoder layers.
             last_step_hs = outputs.hidden_states[-1]  # last generation step
             last_layer_hs = last_step_hs[-1]           # last layer
             last_token_hs = last_layer_hs[:, -1, :]    # (batch, hidden_dim)
             hidden_dim = last_token_hs.shape[-1]
 
-            # Convert to CPU list BEFORE freeing GPU memory
+            # 单层 hidden state（向后兼容）
             hs_list = last_token_hs[0].float().cpu().tolist()
+
+            # 所有层 hidden states（可选）
+            all_layers_b64 = None
+            num_layers = len(last_step_hs) - 1  # 不含 embedding 层
+            if request.output_all_layers:
+                # 提取每层 last token: (num_layers, hidden_dim)，跳过 layer 0 (embedding)
+                all_layers = torch.stack(
+                    [last_step_hs[l][:, -1, :].squeeze(0) for l in range(1, len(last_step_hs))]
+                ).float().cpu().numpy()  # (num_layers, hidden_dim)
+                all_layers_b64 = base64.b64encode(all_layers.astype(np.float32).tobytes()).decode('ascii')
+                logger.info(f"All-layer hidden states: shape={all_layers.shape}, "
+                            f"b64_len={len(all_layers_b64)}")
 
             completion_tokens = generated_ids.shape[1]
 
-            # Free GPU memory: hidden_states from all generation steps are huge (~1.5GB+)
+            # Free GPU memory
             del outputs, last_step_hs, last_layer_hs, last_token_hs
             del inputs, generated_ids
             torch.cuda.empty_cache()
@@ -431,6 +446,8 @@ def chat_completions(request: ChatCompletionRequest):
                 layer=-1,
                 hidden_dim=hidden_dim,
                 model=app_state["model_name"],
+                all_layers_b64=all_layers_b64,
+                num_layers=num_layers,
             ),
         )
 
