@@ -19,6 +19,7 @@ import uuid
 import numpy as np
 import torch
 import uvicorn
+from transformers import StoppingCriteria, StoppingCriteriaList
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse
 from PIL import Image
@@ -409,6 +410,36 @@ def chat_completions(request: ChatCompletionRequest):
                     else:
                         gen_kwargs["do_sample"] = False
 
+                    # 重复检测：连续 N 个相同 token 时提前停止
+                    class RepetitionStopper(StoppingCriteria):
+                        def __init__(self, threshold=30):
+                            self.threshold = threshold
+                            self.stopped_early = False
+                        def __call__(self, input_ids, scores, **kwargs):
+                            if input_ids.shape[1] < self.threshold:
+                                return False
+                            last_tokens = input_ids[0, -self.threshold:]
+                            if torch.all(last_tokens == last_tokens[0]):
+                                self.stopped_early = True
+                                return True
+                            return False
+
+                    # 超时保护：在客户端超时前停止，返回已生成内容
+                    class TimeoutStopper(StoppingCriteria):
+                        def __init__(self, max_seconds=240):
+                            self.max_seconds = max_seconds
+                            self.start_time = time.time()
+                            self.stopped_early = False
+                        def __call__(self, input_ids, scores, **kwargs):
+                            if time.time() - self.start_time > self.max_seconds:
+                                self.stopped_early = True
+                                return True
+                            return False
+
+                    rep_stopper = RepetitionStopper(threshold=30)
+                    timeout_stopper = TimeoutStopper(max_seconds=240)
+                    gen_kwargs["stopping_criteria"] = StoppingCriteriaList([rep_stopper, timeout_stopper])
+
                     outputs = model.generate(**inputs, **gen_kwargs)
             finally:
                 # 确保 hook 一定被移除
@@ -420,6 +451,18 @@ def chat_completions(request: ChatCompletionRequest):
             response_text = processor.batch_decode(
                 generated_ids, skip_special_tokens=True
             )[0]
+
+            # 提前停止检测
+            finish_reason = "stop"
+            if rep_stopper.stopped_early:
+                finish_reason = "repetition_stop"
+                logger.warning(f"Repetition detected after {generated_ids.shape[1]} tokens, stopped early. "
+                               f"preview={response_text[:80]!r}")
+            elif timeout_stopper.stopped_early:
+                finish_reason = "timeout_stop"
+                logger.warning(f"Generation timeout after {generated_ids.shape[1]} tokens / "
+                               f"{time.time() - timeout_stopper.start_time:.0f}s, returning partial content. "
+                               f"preview={response_text[:80]!r}")
 
             # Extract hidden states.
             # outputs.hidden_states is a tuple of (num_generated_tokens) elements.
@@ -470,7 +513,7 @@ def chat_completions(request: ChatCompletionRequest):
             model=app_state["model_name"],
             choices=[Choice(
                 message=ChoiceMessage(content=response_text),
-                finish_reason="stop",
+                finish_reason=finish_reason,
             )],
             usage=Usage(
                 prompt_tokens=input_len,
