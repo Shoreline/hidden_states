@@ -462,7 +462,7 @@ def chat_completions(request: ChatCompletionRequest):
                             return False
 
                     rep_stopper = RepetitionStopper(prompt_len=input_len)
-                    timeout_stopper = TimeoutStopper(max_seconds=120)
+                    timeout_stopper = TimeoutStopper(max_seconds=270)
                     gen_kwargs["stopping_criteria"] = StoppingCriteriaList([rep_stopper, timeout_stopper])
 
                     outputs = model.generate(**inputs, **gen_kwargs)
