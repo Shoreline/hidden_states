@@ -410,18 +410,34 @@ def chat_completions(request: ChatCompletionRequest):
                     else:
                         gen_kwargs["do_sample"] = False
 
-                    # 重复检测：连续 N 个相同 token 时提前停止
+                    # 重复检测：单 token 重复或短语级重复时提前停止
                     class RepetitionStopper(StoppingCriteria):
-                        def __init__(self, threshold=30):
-                            self.threshold = threshold
+                        def __init__(self, single_threshold=20, pattern_window=100, pattern_ratio=0.6):
+                            self.single_threshold = single_threshold  # 连续相同 token 阈值
+                            self.pattern_window = pattern_window      # 短语重复检测窗口
+                            self.pattern_ratio = pattern_ratio        # 重复占比阈值
                             self.stopped_early = False
                         def __call__(self, input_ids, scores, **kwargs):
-                            if input_ids.shape[1] < self.threshold:
-                                return False
-                            last_tokens = input_ids[0, -self.threshold:]
-                            if torch.all(last_tokens == last_tokens[0]):
-                                self.stopped_early = True
-                                return True
+                            seq_len = input_ids.shape[1]
+                            # 检测 1: 连续相同 token
+                            if seq_len >= self.single_threshold:
+                                last = input_ids[0, -self.single_threshold:]
+                                if torch.all(last == last[0]):
+                                    self.stopped_early = True
+                                    return True
+                            # 检测 2: 短语级重复（检查窗口内是否有周期性模式）
+                            if seq_len >= self.pattern_window:
+                                window = input_ids[0, -self.pattern_window:]
+                                for period in range(2, 20):  # 检查周期 2~19 的重复
+                                    if self.pattern_window < period * 3:
+                                        break
+                                    chunk = window[:period]
+                                    repeats = self.pattern_window // period
+                                    repeated = chunk.repeat(repeats)[:self.pattern_window]
+                                    match_ratio = (window == repeated).float().mean().item()
+                                    if match_ratio >= self.pattern_ratio:
+                                        self.stopped_early = True
+                                        return True
                             return False
 
                     # 超时保护：在客户端超时前停止，返回已生成内容
