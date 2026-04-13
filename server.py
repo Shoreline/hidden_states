@@ -452,7 +452,7 @@ def chat_completions(request: ChatCompletionRequest):
                                 return True
                             return False
 
-                    rep_stopper = RepetitionStopper(threshold=30)
+                    rep_stopper = RepetitionStopper(single_threshold=20)
                     timeout_stopper = TimeoutStopper(max_seconds=240)
                     gen_kwargs["stopping_criteria"] = StoppingCriteriaList([rep_stopper, timeout_stopper])
 
