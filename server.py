@@ -436,10 +436,14 @@ def chat_completions(request: ChatCompletionRequest):
                                 for period in range(2, 20):
                                     if check_len < period * 3:
                                         break
+                                    # 只比较能整除的部分
+                                    usable_len = (check_len // period) * period
+                                    if usable_len < period * 3:
+                                        continue
                                     chunk = window[:period]
-                                    repeats = check_len // period
-                                    repeated = chunk.repeat(repeats)[:check_len]
-                                    match_ratio = (window == repeated).float().mean().item()
+                                    repeated = chunk.repeat(usable_len // period)
+                                    window_trimmed = window[:usable_len]
+                                    match_ratio = (window_trimmed == repeated).float().mean().item()
                                     if match_ratio >= self.pattern_ratio:
                                         self.stopped_early = True
                                         return True
