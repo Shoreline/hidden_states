@@ -412,28 +412,33 @@ def chat_completions(request: ChatCompletionRequest):
 
                     # 重复检测：单 token 重复或短语级重复时提前停止
                     class RepetitionStopper(StoppingCriteria):
-                        def __init__(self, single_threshold=20, pattern_window=100, pattern_ratio=0.6):
+                        def __init__(self, prompt_len, single_threshold=20, pattern_window=100, pattern_ratio=0.6):
+                            self.prompt_len = prompt_len              # prompt token 数量，只检查生成部分
                             self.single_threshold = single_threshold  # 连续相同 token 阈值
                             self.pattern_window = pattern_window      # 短语重复检测窗口
                             self.pattern_ratio = pattern_ratio        # 重复占比阈值
                             self.stopped_early = False
                         def __call__(self, input_ids, scores, **kwargs):
-                            seq_len = input_ids.shape[1]
+                            gen_len = input_ids.shape[1] - self.prompt_len
+                            if gen_len < self.single_threshold:
+                                return False
+                            generated = input_ids[0, self.prompt_len:]
                             # 检测 1: 连续相同 token
-                            if seq_len >= self.single_threshold:
-                                last = input_ids[0, -self.single_threshold:]
+                            if gen_len >= self.single_threshold:
+                                last = generated[-self.single_threshold:]
                                 if torch.all(last == last[0]):
                                     self.stopped_early = True
                                     return True
                             # 检测 2: 短语级重复（检查窗口内是否有周期性模式）
-                            if seq_len >= self.pattern_window:
-                                window = input_ids[0, -self.pattern_window:]
-                                for period in range(2, 20):  # 检查周期 2~19 的重复
-                                    if self.pattern_window < period * 3:
+                            check_len = min(gen_len, self.pattern_window)
+                            if check_len >= 40:  # 至少 40 个生成 token 才检查
+                                window = generated[-check_len:]
+                                for period in range(2, 20):
+                                    if check_len < period * 3:
                                         break
                                     chunk = window[:period]
-                                    repeats = self.pattern_window // period
-                                    repeated = chunk.repeat(repeats)[:self.pattern_window]
+                                    repeats = check_len // period
+                                    repeated = chunk.repeat(repeats)[:check_len]
                                     match_ratio = (window == repeated).float().mean().item()
                                     if match_ratio >= self.pattern_ratio:
                                         self.stopped_early = True
@@ -452,7 +457,7 @@ def chat_completions(request: ChatCompletionRequest):
                                 return True
                             return False
 
-                    rep_stopper = RepetitionStopper(single_threshold=20)
+                    rep_stopper = RepetitionStopper(prompt_len=input_len)
                     timeout_stopper = TimeoutStopper(max_seconds=240)
                     gen_kwargs["stopping_criteria"] = StoppingCriteriaList([rep_stopper, timeout_stopper])
 
