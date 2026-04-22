@@ -50,6 +50,10 @@ _force_all_layers = False
 _injection_vectors: dict[str, torch.Tensor] = {}
 _injection_counter = 0
 
+# 全局注入配置（用于 VSP 等无法走 extra_body 的场景）
+# 当 request 中未指定 injection_id 且此处非 None 时，应用全局注入
+_global_injection: Optional[dict] = None  # {id, alpha, mode, layer, target, relative}
+
 
 # --- Request/Response models ---
 
@@ -309,12 +313,42 @@ async def set_output_all_layers(enabled: bool = True):
     return {"output_all_layers": enabled}
 
 
+@app.post("/admin/set_active_injection")
+async def set_active_injection(
+    injection_id: Optional[str] = None,
+    alpha: float = 1.0,
+    mode: str = "all",
+    layer: int = -1,
+    target: str = "all",
+    relative: bool = False,
+):
+    """设置/清除全局注入（用于 VSP 等无法走 extra_body 的场景）。
+
+    请求级 injection_id 优先。injection_id=None 或空字符串表示清除全局注入。
+    """
+    global _global_injection
+    if not injection_id:
+        _global_injection = None
+        logger.info("Active injection cleared")
+        return {"active": False}
+    if injection_id not in _injection_vectors:
+        return JSONResponse(status_code=404,
+                            content={"error": f"Unknown injection_id: {injection_id}"})
+    _global_injection = {
+        "id": injection_id, "alpha": alpha, "mode": mode,
+        "layer": layer, "target": target, "relative": relative,
+    }
+    logger.info(f"Active injection set: {_global_injection}")
+    return {"active": True, "config": _global_injection}
+
+
 @app.get("/admin/config")
 async def get_admin_config():
     """查看当前服务端配置。"""
     return {
         "output_all_layers": _force_all_layers,
         "injection_vectors": list(_injection_vectors.keys()),
+        "active_injection": _global_injection,
         "model": app_state.get("model_name"),
         "decoder_layers_path": app_state.get("decoder_layers_path"),
     }
@@ -375,21 +409,46 @@ def chat_completions(request: ChatCompletionRequest):
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
         input_len = inputs["input_ids"].shape[1]
 
-        # 准备 injection hook（如果请求了注入）
+        # 准备 injection hook
+        # 优先用请求级参数，否则用全局 (_global_injection，由 /admin/set_active_injection 设置)
         hook_handle = None
         injection_active = False
+        injection_source = None  # "request" or "global"
+        active_inj_id = None
+        active_alpha = 0.0
+        active_mode = "all"
+        active_layer = -1
+        active_target = "last"
+        active_relative = False
+
         if request.injection_id and request.injection_alpha != 0.0:
-            v_hat = _injection_vectors.get(request.injection_id)
+            active_inj_id = request.injection_id
+            active_alpha = request.injection_alpha
+            active_mode = request.injection_mode
+            active_layer = request.injection_layer
+            active_target = request.injection_target
+            active_relative = request.injection_relative
+            injection_source = "request"
+        elif _global_injection is not None:
+            active_inj_id = _global_injection["id"]
+            active_alpha = _global_injection["alpha"]
+            active_mode = _global_injection["mode"]
+            active_layer = _global_injection["layer"]
+            active_target = _global_injection["target"]
+            active_relative = _global_injection["relative"]
+            injection_source = "global"
+
+        if active_inj_id and active_alpha != 0.0:
+            v_hat = _injection_vectors.get(active_inj_id)
             if v_hat is None:
                 raise HTTPException(status_code=400,
-                                    detail=f"Unknown injection_id: {request.injection_id}")
+                                    detail=f"Unknown injection_id: {active_inj_id}")
             decoder_layers = app_state.get("decoder_layers")
             if decoder_layers is None:
                 raise HTTPException(status_code=500, detail="Decoder layers not found — injection unavailable")
-            target_layer = decoder_layers[request.injection_layer]
-            hook_fn = make_injection_hook(v_hat, request.injection_alpha, request.injection_mode,
-                                           relative=request.injection_relative,
-                                           target=request.injection_target)
+            target_layer = decoder_layers[active_layer]
+            hook_fn = make_injection_hook(v_hat, active_alpha, active_mode,
+                                           relative=active_relative, target=active_target)
             hook_handle = target_layer.register_forward_hook(hook_fn)
             injection_active = True
 
@@ -523,10 +582,10 @@ def chat_completions(request: ChatCompletionRequest):
         elapsed = time.time() - t0
         injection_info = ""
         if injection_active:
-            injection_info = (f", injection=[id={request.injection_id}, "
-                              f"alpha={request.injection_alpha}, mode={request.injection_mode}, "
-                              f"layer={request.injection_layer}, target={request.injection_target}, "
-                              f"relative={request.injection_relative}]")
+            injection_info = (f", injection=[src={injection_source}, id={active_inj_id}, "
+                              f"alpha={active_alpha}, mode={active_mode}, "
+                              f"layer={active_layer}, target={active_target}, "
+                              f"relative={active_relative}]")
         logger.info(
             f"[{elapsed:.1f}s] prompt={input_len} tokens, generated={completion_tokens} tokens, "
             f"hidden_dim={hidden_dim}{injection_info}, preview={response_text[:80]!r}"
